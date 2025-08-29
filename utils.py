@@ -38,7 +38,20 @@ from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis, LinearD
 from sklearn import metrics
 import time
 from xgboost import XGBClassifier
-from sklearn.preprocessing import label_binarize
+from sklearn.preprocessing import label_binarize, LabelEncoder
+from typing import List, Tuple, Dict, Any, Optional, Union
+from sklearn.svm import SVC
+from sklearn.base import BaseEstimator
+from sklearn.metrics import accuracy_score
+import ast  
+import re
+from scipy.stats import mode
+
+
+
+########################
+# Image pre-processing #
+########################
 
 """ create a 2-D gaussian blurr filter for a given mean and std """
 def create_2d_gaussian(size=9, std=1.5):
@@ -94,7 +107,56 @@ def summarize_blobs(blobs, image_shape):
     ]
     return np.array(features)
 
+# contrast stretching
+def contrast_stretching(in_img):
+  # get min and max
+  min_v = np.min(in_img)
+  max_v = np.max(in_img)
 
+  # rescale intensity to min/max range
+  out_img = exposure.rescale_intensity(in_img, in_range=(min_v, max_v))
+  return out_img
+
+# gamma correction
+def gamma_correction(in_img, gamma, with_sigmoid=False):
+  # convert img to float64
+  f_img = in_img.astype(np.float64)/255.0
+
+  # apply gamma
+  if with_sigmoid:
+    g_img = 1/(1+np.exp(-gamma*(f_img-0.5)))
+  else: 
+    g_img = f_img ** gamma
+
+  # convert img back to uint8
+  out_img = (g_img * 255).astype(np.uint8)
+  return out_img
+
+# histogram equalization
+def histogram_equalization(in_img):
+  # compute cdf
+  img_cdf, bins = exposure.cumulative_distribution(in_img, 256)
+
+  # create empty array for all possible pixel values
+  new_cdf = np.zeros(256)
+
+  # populate array with values from cdf
+  # use bins as the index into the array
+  new_cdf[bins] = img_cdf
+
+  # create empty array the same size as the image
+  out_img = np.zeros(in_img.shape, dtype=in_img.dtype)
+
+  # for each pixel, look up the value from the cdf
+  for i in range(out_img.shape[0]):
+    for j in range(out_img.shape[1]):
+      out_img[i, j] = (new_cdf[ in_img[i, j] ] * 255)
+
+  return out_img
+
+#######################
+# Feature engineering #
+#######################
 
 #============== Complex feature ====================================
 ''' Complex Features '''
@@ -259,9 +321,53 @@ def combine_load_and_validate_joblib(
 
 # ================================== End of Complex feat ======================================
 
+def preprocess_image_dog(image):
+   # contrast equalization
+  clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+  clahe_img = clahe.apply(image)
 
+  # apply vignette on images so that edges are less emphasized for DoG computation
+  clahe_img = clahe_img.astype(np.float32)/255.0
+  mean_pixel_intensity = np.mean(clahe_img)
+  h, w = clahe_img.shape
+  center_x, center_y = w // 2, h // 2
+  # Step 2: Create radial mask centered in image
+  Y, X = np.ogrid[:h, :w]
+  dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
+  max_dist = np.sqrt(center_x**2 + center_y**2)
+  mask = 1 - (dist / max_dist)
+  mask = np.clip(mask, 0, 1)
+  if (mean_pixel_intensity > 0.3):
+    mask = mask**1.6  # steeper falloff
+  elif (mean_pixel_intensity < 0.15):
+    mask = mask**1.5
+  # Step 3: Apply mask
+  img_masked = clahe_img * mask
+  return img_masked
 
+def preprocess_image_doh(image):
+  # contrast equalization
+  clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+  clahe_img = clahe.apply(image)
 
+  # apply vignette on images so that edges are less emphasized for DoG computation
+  clahe_img = clahe_img.astype(np.float32)/255.0
+  mean_pixel_intensity = np.mean(clahe_img)
+  h, w = clahe_img.shape
+  center_x, center_y = w // 2, h // 2
+  # Step 2: Create radial mask centered in image
+  Y, X = np.ogrid[:h, :w]
+  dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
+  max_dist = np.sqrt(center_x**2 + center_y**2)
+  mask = 1 - (dist / max_dist)
+  mask = np.clip(mask, 0, 1)
+  if (mean_pixel_intensity > 0.3):
+    mask = mask**1.6  # steeper falloff
+  elif (mean_pixel_intensity < 0.15):
+    mask = mask**1.5
+  # Step 3: Apply mask
+  img_masked = clahe_img * mask
+  return img_masked
 
 def get_features(in_imgs: Optional[np.ndarray], 
                  feat_name='canny',
@@ -274,8 +380,7 @@ def get_features(in_imgs: Optional[np.ndarray],
                  return_bundle: bool = False):
     features = []
     if feat_name == 'canny':
-        #for i in tqdm(range(in_imgs.shape[0]), desc = 'Canny Edge Images'):
-        for i in range(in_imgs.shape[0]):
+        for i in tqdm(range(in_imgs.shape[0]), desc = 'Canny Edge Images'):
             image = in_imgs[i]
             img_uint8 = (image * 255).astype(np.uint8)
             edges = cv.Canny(img_uint8, threshold1=50, threshold2=150)
@@ -287,61 +392,27 @@ def get_features(in_imgs: Optional[np.ndarray],
         return features
 
     if feat_name == 'blob_dog':
-        # stack extracted hog features into array
-        # also save the first hog image for plotting
         max_features = 0
-        #for i in tqdm(range(in_imgs.shape[0]), desc = 'Blob Dog Images'):
-        for i in range(in_imgs.shape[0]):
+        for i in tqdm(range(in_imgs.shape[0]), desc = 'Blob Dog Images'):
             #print("Blob DoG Image:" + str(i))
-            image = in_imgs[i]
-            mean_pixel_intensity = np.mean(image)
-            brightness_adjusted_img = image.copy()
-
-            # lower brights
-            if (mean_pixel_intensity > 0.3):
-                bright_mask = image > 0.6
-                brightness_adjusted_img[bright_mask] = brightness_adjusted_img[bright_mask] * 0.2
-            # brighten darks
-            elif (mean_pixel_intensity < 0.15):
-                dark_mask = image < 0.2
-                brightness_adjusted_img[dark_mask] = brightness_adjusted_img[dark_mask] * 2.0
-
-            # apply vignette on images so that edges are less emphasized for DoG computation
-            h, w = image.shape
-            center_x, center_y = w // 2, h // 2
-            # Step 2: Create radial mask centered in image
-            Y, X = np.ogrid[:h, :w]
-            dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
-            max_dist = np.sqrt(center_x**2 + center_y**2)
-            mask = 1 - (dist / max_dist)
-            mask = np.clip(mask, 0, 1)
-            if (mean_pixel_intensity > 0.3):
-                mask = mask**1.6  # steeper falloff
-            elif (mean_pixel_intensity < 0.15):
-                mask = mask**1.5
-            # Step 3: Apply mask
-            img_masked = brightness_adjusted_img * mask
+            image = (in_imgs[i]*255).astype(np.uint8)
+            
+            img_masked = preprocess_image_dog(image)
 
             # Apply DoG
-            large_low_sigma, large_high_sigma = 30, 40
-            # small_low_sigma, small_high_sigma = 20, 30
-            # dog_image_large_blobs = difference_of_gaussians(img_masked, large_low_sigma, large_high_sigma)
-            # dog_image_small_blobs = difference_of_gaussians(img_masked, small_low_sigma, small_high_sigma)
-            # blobs_dog_small = blob_dog(img_masked, min_sigma=small_low_sigma, max_sigma=small_high_sigma, threshold=0.078)
-            # blobs_dog_small[:, 2] = blobs_dog_small[:, 2] * np.sqrt(2)
+            large_low_sigma, large_high_sigma = 24, 40
+            small_low_sigma, small_high_sigma = 20, 30
+            dog_image_large_blobs = difference_of_gaussians(img_masked, large_low_sigma, large_high_sigma)
+            dog_image_small_blobs = difference_of_gaussians(img_masked, small_low_sigma, small_high_sigma)
+            blobs_dog_small = blob_dog(img_masked, min_sigma=small_low_sigma, max_sigma=small_high_sigma, threshold=0.078)
+            blobs_dog_small[:, 2] = blobs_dog_small[:, 2] * np.sqrt(2)
             blobs_dog_large = blob_dog(img_masked, min_sigma=large_low_sigma, max_sigma=large_high_sigma, threshold=0.056)
             blobs_dog_large[:, 2] = blobs_dog_large[:, 2] * np.sqrt(2)
-
-
-            # # Rescale for better display
-            # dog_image_large_blobs_rescaled = exposure.rescale_intensity(dog_image_large_blobs, in_range=(0, 0.3))
-            # dog_image_small_blobs_rescaled = exposure.rescale_intensity(dog_image_small_blobs, in_range=(0, 0.3))
-
 
             # blob_dog_final = blobs_dog_large.flatten()
             # if blob_dog_final.shape[0] > max_features:
             #     max_features = blob_dog_final.shape[0]
-            summary_feature = summarize_blobs(blobs_dog_large, image.shape)
+            summary_feature = summarize_blobs(np.vstack((blobs_dog_large, blobs_dog_small)), image.shape)
             features.append(summary_feature)
             
         # pbar = tqdm(range(len(features)), desc="Padding Features")
@@ -353,54 +424,26 @@ def get_features(in_imgs: Optional[np.ndarray],
     
     if feat_name == 'blob_doh':
         max_features = 0
-        #for i in tqdm(range(in_imgs.shape[0]), desc = 'Blob DoH images'):
-        for i in range(in_imgs.shape[0]):
+        for i in tqdm(range(in_imgs.shape[0]), desc = 'Blob DoH images'):
             #print("DoH Image: " + str(i))
-            image = in_imgs[i]
-            mean_pixel_intensity = np.mean(image)
-            brightness_adjusted_img = image.copy()
-            # lower brights
-            if (mean_pixel_intensity > 0.3):
-                bright_mask = image > 0.6
-                brightness_adjusted_img[bright_mask] = brightness_adjusted_img[bright_mask] * 0.2
-            # brighten darks
-            elif (mean_pixel_intensity < 0.15):
-                dark_mask = image < 0.2
-                brightness_adjusted_img[dark_mask] = brightness_adjusted_img[dark_mask] * 2.0
-
-            # apply vignette on images so that edges are less emphasized for DoG computation
-            h, w = image.shape
-            center_x, center_y = w // 2, h // 2
-            # Step 2: Create radial mask centered in image
-            Y, X = np.ogrid[:h, :w]
-            dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
-            max_dist = np.sqrt(center_x**2 + center_y**2)
-            mask = 1 - (dist / max_dist)
-            mask = np.clip(mask, 0, 1)
-            if (mean_pixel_intensity > 0.3):
-                mask = mask**1.6  # steeper falloff
-            elif (mean_pixel_intensity < 0.15):
-                mask = mask**1.5
-            # Step 3: Apply mask
-            img_masked = brightness_adjusted_img * mask
+            image = (in_imgs[i]*255).astype(np.uint8)
+            
+            img_masked = preprocess_image_doh(image)
 
             # Apply DoH
-            large_low_sigma, large_high_sigma = 25, 45
-            # small_low_sigma, small_high_sigma = 10, 30
-            # doh_image_large_blobs = hessian_matrix_det(img_masked, large_low_sigma)
-            # doh_image_small_blobs = hessian_matrix_det(img_masked, small_low_sigma)
-            # blobs_doh_small = blob_doh(img_masked, min_sigma=small_low_sigma, max_sigma=small_high_sigma, threshold=0.002)
-            # blobs_doh_small[:, 2] = blobs_doh_small[:, 2] * np.sqrt(2)
+            large_low_sigma, large_high_sigma = 30, 45
+            small_low_sigma, small_high_sigma = 10, 30
+            doh_image_large_blobs = hessian_matrix_det(img_masked, large_low_sigma)
+            doh_image_small_blobs = hessian_matrix_det(img_masked, small_low_sigma)
+            blobs_doh_small = blob_doh(img_masked, min_sigma=small_low_sigma, max_sigma=small_high_sigma, threshold=0.0025)
+            blobs_doh_small[:, 2] = blobs_doh_small[:, 2] * np.sqrt(2)
             blobs_doh_large = blob_doh(img_masked, min_sigma=large_low_sigma, max_sigma=large_high_sigma, threshold=0.0015)
             blobs_doh_large[:, 2] = blobs_doh_large[:, 2] * np.sqrt(2)
-            # # Rescale for better display
-            # doh_image_large_blobs_rescaled = exposure.rescale_intensity(doh_image_large_blobs, in_range=(0, 0.0001))
-            # doh_image_small_blobs_rescaled = exposure.rescale_intensity(doh_image_small_blobs, in_range=(0, 0.0001))
 
             # blobs_doh_final = blobs_doh_large.flatten()
             # if blobs_doh_final.shape[0] > max_features:
             #     max_features = blobs_doh_final.shape[0]
-            summary_feature = summarize_blobs(blobs_doh_large, image.shape)
+            summary_feature = summarize_blobs(np.vstack((blobs_doh_large,blobs_doh_small)), image.shape)
             features.append(summary_feature)
         
         # pbar = tqdm(range(len(features)), desc="Padding Features")
@@ -432,8 +475,148 @@ def get_features(in_imgs: Optional[np.ndarray],
 
     return None
 
+##########################
+# Feature saving/loading #
+##########################
 
-def get_PCA(X_list, n_components=[15,15,100]):
+def get_path(image_file_path):
+    """
+    Args: 
+        image_file_path: full image file path
+    Returns:
+        portion of path up until the /Training or /Testing folder (e.g. '/Training/glioma/Tr-gl_0952.jpg')
+    """
+    file_name = os.path.basename(image_file_path)
+    parent_dir = os.path.dirname(image_file_path)
+    parent_dir_name = os.path.basename(parent_dir)
+    grandparent_dir = os.path.dirname(parent_dir)
+    grandparent_dir_name = os.path.basename(grandparent_dir)
+    return os.path.join("/",grandparent_dir_name, parent_dir_name, file_name)
+
+def get_paths(image_file_paths):
+    """
+    Applies get_path (see above) for list of full image file paths.
+    """
+    paths = []
+    for file_path in image_file_paths:
+        paths.append(get_path(file_path))
+    paths = np.array(paths).reshape(-1,1)
+    return paths
+
+def get_updated_aligned_features(aligned_features_path, new_features_df):
+    """
+    Reads in pandas dataframe from aligned_features_path and updates it with new_features_df. Displays result.
+    (Note: does not save the updated df. This must be done separately.)
+    Args:
+        aligned_features_path: file path of aligned features CSV (e.g. 'aligned_training_features.csv')
+        new_features_df: pandas dataframe with columns for 'filepath' (e.g. contains paths like '/Training/glioma/Tr-gl_0952.jpg') and new features to update
+    Returns:
+        aligned features pandas dataframe updated with new features
+    """
+    aligned_features_df = pd.read_csv(aligned_features_path)
+    new_features_df_columns = new_features_df.columns.tolist()
+    new_features_names = [col for col in new_features_df_columns if col != 'filepath']
+    aligned_features_df = pd.merge(aligned_features_df, new_features_df, on='filepath')
+    aligned_features_df = aligned_features_df.rename(columns={col+"_y": col for col in new_features_names})
+    aligned_features_df.drop(columns=[col+'_x' for col in new_features_names], inplace=True, errors='ignore')
+    display(aligned_features_df.head())
+    return aligned_features_df
+
+def clean_df(
+    df: pd.DataFrame,
+    label_col: str,
+    feat_cols: List[str],
+) -> Tuple[pd.DataFrame, Dict[str, int], Optional[LabelEncoder]]:
+
+    """ clean_df, dims, enc = clean_df (
+    df=df,
+    label_col="target",
+    feat_cols=["feat_canny", "feat_vec", "feat_dog", "feat_doh"]
+    )"""
+
+    def _to_array(x: Union[str, list, tuple, np.ndarray]) -> np.ndarray:
+
+
+        if isinstance(x, (list, tuple, np.ndarray)):
+            return np.asarray(x, dtype=np.float32)
+
+        if isinstance(x, str):
+            s = x.strip()
+            try:
+                parsed = ast.literal_eval(s)
+                return np.asarray(parsed, dtype=np.float32)
+            except Exception:
+                pass 
+            s = s.lstrip("[").rstrip("]")
+            s = re.sub(r"[,'\"\[\]]", " ", s)        # drop quotes & commas
+            return np.fromstring(s, sep=" ", dtype=np.float32)
+        return np.asarray([x], dtype=np.float32)
+
+
+    missing = [c for c in feat_cols + [label_col] if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing columns: {missing}")
+
+    cleaned = df.copy(deep=True)
+    dims: Dict[str, int] = {}
+
+    for col in feat_cols:
+        arrs    = cleaned[col].apply(_to_array)
+        lengths = arrs.map(len)
+        if lengths.nunique() != 1:
+            raise ValueError(
+                f"Inconsistent vector lengths in '{col}':\n{lengths.value_counts()}"
+            )
+        cleaned[col] = arrs
+        dims[col]    = lengths.iloc[0]
+
+    def _to_scalar(v):
+        if isinstance(v, np.ndarray):
+            return v.item()
+        if isinstance(v, (list, tuple)) and len(v) == 1:
+            return v[0]
+        return v
+
+    y_series  = cleaned[label_col].apply(_to_scalar)
+    y_numeric = pd.to_numeric(y_series, errors="coerce")
+
+    numeric_ok = y_numeric.notna().all() and np.allclose(
+        y_numeric, np.round(y_numeric)
+    )
+
+    encoder: Optional[LabelEncoder] = None
+    if numeric_ok:
+        cleaned[label_col] = y_numeric.astype(np.int32)
+    else:
+        encoder = LabelEncoder()
+        cleaned[label_col] = (
+            encoder.fit_transform(y_series.astype(str)).astype(np.int32)
+        )
+
+    return cleaned, dims, encoder
+
+def parse_aligned_features(aligned_df, features):
+    """
+    Args:
+        aligned_df: output pandas dataframe from clean_df()
+        features: list of feature names to parse numpy arrays for
+    Returns:
+        dictionary mapping column names from pandas aligned_df to corresponding numpy arrays/matrices
+        i.e. {"filepaths": <numpy array>, "target": <numpy array>, "feat_vec": <numpy matrix>, ...}
+        
+    """
+    result_dict = {}
+    result_dict['filepath'] = aligned_df['filepath'].to_numpy()
+    result_dict['target'] = aligned_df['target'].to_numpy()
+    for feature in features:
+        result_dict[feature] = np.vstack(aligned_df[feature].values)
+    return result_dict
+
+##############################
+# Feature dimensionality EDA #
+##############################
+
+def get_PCA(X_list, n_components=[14,14,100,100]):
     pca_list = []
     xpca_list = []
     for index, X in enumerate(X_list):
@@ -443,16 +626,12 @@ def get_PCA(X_list, n_components=[15,15,100]):
         xpca_list.append(X_pca)
     return pca_list, xpca_list
 
-def plot_PCA(X_list, n_components=[15,15,100]):
+def plot_PCA(X_list, n_components=[14,14,100,100], labels=['dog features', 'doh features','canny features','complex features'], colors=['r-', 'b-','g-','p-']):
     pca_list, xpca_list = get_PCA(X_list, n_components=n_components)
 
     plt.figure(figsize=(15,5))
-    colors = ['r-', 'b-','g-','p-']
-    labels = ['dog features', 'doh features','canny_features','complex_features']
     for i in range(len(X_list)):
         plt.plot(np.cumsum(pca_list[i].explained_variance_ratio_), colors[i], label=labels[i])
-        plt.xticks(np.linspace(0, n_components[i]+1, 50))
-        plt.yticks(np.linspace(0, 1.2, 8))
         plt.grid(True)
         plt.xlabel('Number of components')
         plt.ylabel('Explained Variances')
@@ -467,6 +646,41 @@ def get_tsne(X_list, n_components=2):
     X_tsne = tsne.fit_transform(X)
     xtsne_list.append(X_tsne)
   return xtsne_list
+
+
+def plot_classes(X, y, title):
+    """
+    Plots 2D or 3D scatter plot of X, color-differentiated according to y.
+    """
+    le = LabelEncoder()
+    le.fit(y)
+    y_enc = le.transform(y)
+
+    fig = plt.figure(figsize=(10,10))
+    if X.shape[1] > 2:
+        ax = fig.add_subplot(projection='3d')
+    else:
+        ax = fig.add_subplot()
+
+    # color code each cluster (person ID)
+    colormap = plt.cm.tab20
+    colorst = [colormap(i) for i in np.linspace(0, 1.0, len(np.unique(y_enc)))]
+
+    # project the features into 2 or 3 dimensions
+    for k in np.unique(y_enc):
+        label = le.classes_[k]
+        if X.shape[1] > 2:
+            ax.scatter(X[y_enc==k, 0], X[y_enc==k, 1], X[y_enc==k, 2], alpha=0.5, facecolors=colorst[k], label=label)
+        else:
+            ax.scatter(X[y_enc==k, 0], X[y_enc==k, 1], alpha=0.5, facecolors=colorst[k], label=label)
+
+    ax.set_title(title)
+    ax.legend()
+
+
+##########################
+# Model training/testing #
+##########################
 
 
 def train_model(X_train, y_train, classes, model_type='logistic', feature='canny'):
@@ -590,7 +804,10 @@ def train_model(X_train, y_train, classes, model_type='logistic', feature='canny
     cm_display = metrics.ConfusionMatrixDisplay(confusion_matrix = confusion_matrix, display_labels = classes)
     cm_display.plot()
     plt.title('Training CM Feature:' + str(feature) + ' Model: ' + str(model_type))
-    plt.savefig('results_images/' + str(feature) + '_' + str(model_type)+'_training_confusion_matrix.png')
+    save_dir = 'results_images'
+    save_path = os.path.join(save_dir, str(feature) + '_' + str(model_type)+'_training_confusion_matrix.png')
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(save_path)
     plt.show()
 
     # # Handle classifier output format
@@ -623,7 +840,10 @@ def train_model(X_train, y_train, classes, model_type='logistic', feature='canny
     plt.title('ROC Curve Feature:' + str(feature) + ' Model: ' + str(model_type))
     plt.legend(loc='lower right')
     plt.grid(True)
-    plt.savefig('results_images/' + str(feature) + '_' + str(model_type)+'_training_roc.png')
+    save_dir = 'results_images'
+    save_path = os.path.join(save_dir, str(feature) + '_' + str(model_type)+'_training_roc.png')
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(save_path)
     plt.show()
 
     accuracy_score = metrics.accuracy_score(y_train, y_model_pred)
@@ -662,7 +882,142 @@ def train_model(X_train, y_train, classes, model_type='logistic', feature='canny
 
     return model.best_estimator_, results_dict
 
+def ensemble_model(
+    model_specs: Dict[str, Tuple[BaseEstimator, np.ndarray, np.ndarray]],
+    X_test_dict: Dict[str, np.ndarray],
+    y_train: np.ndarray,
+    y_val:   np.ndarray,
+    y_test:  np.ndarray,
+    meta_model: BaseEstimator = None
+) -> Dict[str, Any]:
+    """
+    Train base learners on (train, val) matrices in `model_specs`,
+    evaluate on a test-set per model in `X_test_dict`, then stack via a meta-classifier.
 
+    Parameters:
+    model_specs  : dict
+        name -> (estimator, X_train, X_val)
+    X_test_dict  : dict
+        name -> X_test   (must have the same keys as model_specs)
+    y_*          : label vectors, one per split
+    verbose      : print per-model val accuracy and final test accuracy
+
+    Returns:
+    dict with trained objects, predictions, and stacked matrices.
+    
+    
+    Example call:
+    y = clean_df["target"].to_numpy()
+    X_canny_all = np.vstack(clean_df["feat_canny"].values)   # (n_samples, n_canny_feats)
+    X_vec_all   = np.vstack(clean_df["feat_vec"].values)     # (n_samples, n_vec_feats)
+
+    X_canny_train, X_canny_temp, X_vec_train, X_vec_temp, y_train, y_temp = train_test_split(
+        X_canny_all, X_vec_all, y,
+        test_size=0.20, random_state=42, stratify=y
+    )
+    X_canny_val, X_canny_test, X_vec_val, X_vec_test, y_val, y_test = train_test_split(
+        X_canny_temp, X_vec_temp, y_temp,
+        test_size=0.50, random_state=42, stratify=y_temp
+    )
+
+    model_specs = {
+        "canny": (
+            LogisticRegression(max_iter=1000),   # estimator
+            X_canny_train,                       # train matrix
+            X_canny_val                          # val matrix
+        ),
+        "vec": (
+            SVC(kernel="linear", probability=True, max_iter=1000, random_state=42),
+            X_vec_train,
+            X_vec_val
+        )
+    }
+    # Separate dict holding the per-model test matrices
+    X_test_dict = {
+        "canny": X_canny_test,
+        "vec":   X_vec_test
+    }
+    results = ensemble_model(
+        model_specs=model_specs,
+        X_test_dict=X_test_dict,
+        y_train=y_train,
+        y_val=y_val,
+        y_test=y_test,
+        meta_model=LogisticRegression(max_iter=1000)
+    )
+    print("Ensemble test accuracy:", (results["y_pred"] == y_test).mean())
+
+    
+    """
+
+    base_models, val_columns, test_columns = {}, [], []
+
+    # Fit base models & get probs 
+    for name, (model, X_tr, X_val) in model_specs.items():
+        model.fit(X_tr, y_train)
+        base_models[name] = model
+
+        val_prob  = model.predict_proba(X_val)
+        test_prob = model.predict_proba(X_test_dict[name])
+
+        val_columns.append(val_prob)
+        test_columns.append(test_prob)
+
+        acc = accuracy_score(y_val, np.argmax(val_prob, axis=1))
+        print(f"[{name}] val-acc: {acc:0.4f}")
+
+    # Stack prob matrices
+    val_stack  = np.hstack(val_columns)
+    test_stack = np.hstack(test_columns)
+
+    # Train meta-model on stacked val outputs
+    meta_model.fit(val_stack, y_val)
+
+    # Final test-set preds
+    y_pred  = meta_model.predict(test_stack)
+    y_score = meta_model.predict_proba(test_stack)
+
+
+    acc = accuracy_score(y_test, y_pred)
+    print(f"[Ensemble] test-acc: {acc:0.4f}")
+
+    return {
+        "meta_model": meta_model,
+        "base_models": base_models,
+        "y_pred": y_pred,
+        "y_score": y_score,
+        "val_stack": val_stack,
+        "test_stack": test_stack,
+    }
+
+class FeatureVectorEnsemble:
+    def __init__(self, models, feature_sets, use_proba=False):
+        self.models = models
+        self.feature_sets = feature_sets
+        self.use_proba = use_proba  # True = probability averaging, False = majority vote
+
+    def predict(self, idx):
+        """
+        Predicts label for image at index `idx` using the ensemble.
+        """
+        preds = []
+
+        for model, X in zip(self.models, self.feature_sets):
+            x = X[idx].reshape(1, -1)
+            if self.use_proba:
+                proba = model.predict_proba(x)
+                preds.append(proba)
+            else:
+                pred = model.predict(x)[0]
+                preds.append(pred)
+
+        if self.use_proba:
+            avg_proba = np.mean(preds, axis=0)
+            return np.argmax(avg_proba)
+        else:
+            majority_vote, _ = mode(preds)
+            return majority_vote[0]
+        
 
 def test_model(model, X_test_feature, Y_test, classes, model_type='logistic', feature='canny'):
     start_time = time.perf_counter()
@@ -674,8 +1029,10 @@ def test_model(model, X_test_feature, Y_test, classes, model_type='logistic', fe
     cm_display = metrics.ConfusionMatrixDisplay(confusion_matrix = confusion_matrix, display_labels = classes)
     cm_display.plot()
     plt.title("CM Testing Model: " + str(model_type) + " Feature: " + str(feature))
-    plt.savefig('results_images/' + str(feature) + '_' + str(model_type)+'_training_confusion_matrix.png')
-
+    save_dir = 'results_images'
+    save_path = os.path.join(save_dir, str(feature) + '_' + str(model_type)+'_testing_confusion_matrix.png')
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(save_path)
     plt.show()
 
 
@@ -706,7 +1063,10 @@ def test_model(model, X_test_feature, Y_test, classes, model_type='logistic', fe
     plt.title('ROC Testing Curve Feature: ' + str(feature) + ' Model: ' + str(model_type))
     plt.legend(loc='lower right')
     plt.grid(True)
-    plt.savefig('results_images/' + str(feature) + '_' + str(model_type)+'_testing_roc.png')
+    save_dir = 'results_images'
+    save_path = os.path.join(save_dir, str(feature) + '_' + str(model_type)+'_testing_roc.png')
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(save_path)
 
     plt.show()
 
@@ -734,8 +1094,11 @@ def test_model(model, X_test_feature, Y_test, classes, model_type='logistic', fe
 
     return results_dict
 
+########################
+# Model saving/loading #
+########################
 
-def save_models(feature_model_dict, model_path_prefix):
+def save_models(feature_model_dict):
     """
     Saves sklearn model(s) from feature_model_dict to path(s) with specified model_path_prefix.
     Args:
@@ -744,7 +1107,8 @@ def save_models(feature_model_dict, model_path_prefix):
     """
     for feature in feature_model_dict.keys():
         model = feature_model_dict[feature]
-        path = f"{model_path_prefix}//"+f"{feature}.joblib"
+        os.makedirs("models", exist_ok=True)
+        path = f"models/{feature}.joblib"
         joblib.dump(model, path)
         print(f"saved model={model} for feature={feature} to path={path}")
 
@@ -756,11 +1120,11 @@ def load_models(feature_list, model_path_prefix):
         feature_list: list of feature type(s) to load model(s) for
         model_path_prefix: file path prefix to identify model(s) being loaded. e.g. "logistic_model".
     Returns:
-        feature_model_dict: dictionary of feature types to sklearn models. e.g. {'canny', canny_logistic_model, 'complex': complex_logistic_model}
+        feature_model_dict: dictionary of feature types to sklearn models. e.g. {'canny': canny_logistic_model, 'complex': complex_logistic_model}
     """
     feature_model_dict = {}
     for feature in feature_list:
-        path = f"{model_path_prefix}_{feature}.joblib"
+        path = f"models/{model_path_prefix}_{feature}.joblib"
         feature_model_dict[feature] = joblib.load(path)
         print(f"loaded model={feature_model_dict[feature]} for feature={feature} from path={path}")
     return feature_model_dict
